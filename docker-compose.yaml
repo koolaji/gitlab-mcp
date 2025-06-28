@@ -1,0 +1,209 @@
+version: '3.8'
+
+services:
+  ollama:
+    image: docker.arvancloud.ir/ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ./ollama:/root/.ollama:ro
+      - ./git-repos:/git-repos:rw
+    container_name: ollama
+    tty: true
+    restart: unless-stopped
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - OLLAMA_GPU_LAYERS=999
+      - OLLAMA_FLASH_ATTENTION=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # Vector Database - Qdrant (default)
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - ./qdrant_storage:/qdrant/storage
+    environment:
+      - QDRANT__SERVICE__HTTP_PORT=6333
+      - QDRANT__SERVICE__GRPC_PORT=6334
+      - QDRANT__LOG_LEVEL=INFO
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Alternative Vector Databases (use profiles to enable)
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: chromadb
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./chroma_data:/chroma/chroma
+    environment:
+      - IS_PERSISTENT=TRUE
+      - PERSIST_DIRECTORY=/chroma/chroma
+      - ANONYMIZED_TELEMETRY=FALSE
+    restart: unless-stopped
+    profiles: ["chroma"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  weaviate:
+    image: semitechnologies/weaviate:latest
+    container_name: weaviate
+    ports:
+      - "8081:8080"  # ✅ ONLY CHANGE - Fixed port conflict (was 8080:8080)
+    volumes:
+      - ./weaviate_data:/var/lib/weaviate
+    environment:
+      - QUERY_DEFAULTS_LIMIT=25
+      - AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED=true
+      - PERSISTENCE_DATA_PATH=/var/lib/weaviate
+      - DEFAULT_VECTORIZER_MODULE=none
+      - ENABLE_MODULES=
+      - CLUSTER_HOSTNAME=node1
+    restart: unless-stopped
+    profiles: ["weaviate"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/v1/.well-known/ready"]  # ✅ Updated health check URL
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Search Engine
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    ports:
+      - "8888:8080"
+    volumes:
+      - ./searxng:/etc/searxng:rw
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8888/
+      - SEARXNG_PORT=8080
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "1m"
+        max-file: "1"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Custom MCP GitLab Server for git.snpb.app
+  mcp-gitlab-server:
+    build:
+      context: ./mcp-gitlab-custom
+      dockerfile: Dockerfile
+    container_name: mcp-gitlab-server
+    volumes:
+      - ./git-repos:/git-repos:rw
+      - ./mcp-gitlab-config:/app/config:ro
+      - ./ssh-keys:/root/.ssh:ro
+      - ./gitlab-cache:/app/cache:rw
+      - ./gitlab-webhooks:/app/webhooks:rw
+    ports:
+      - "3333:3333"  # MCP Server
+      - "3334:3334"  # Webhook endpoint
+    environment:
+      - NODE_ENV=production
+      - GIT_REPOS_PATH=/git-repos
+      - MCP_SERVER_PORT=3333
+      - WEBHOOK_PORT=3334
+      - GIT_AUTHOR_NAME=MCP GitLab Bot
+      - GIT_AUTHOR_EMAIL=mcp-bot@snpb.app
+      - GITLAB_URL=https://git.snpb.app
+      - GITLAB_TOKEN_FILE=/app/config/gitlab-token
+      - GITLAB_SSH_KEY_PATH=/root/.ssh/id_rsa
+      - GITLAB_CACHE_DIR=/app/cache
+      - GITLAB_WEBHOOK_SECRET_FILE=/app/config/webhook-secret
+    restart: unless-stopped
+    depends_on:
+      - ollama
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3333/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Open WebUI
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    volumes:
+      - ./open-webui:/app/backend/data
+      - ./git-repos:/git-repos:ro
+    depends_on:
+      - ollama
+      - qdrant
+      - searxng
+      - mcp-gitlab-server
+    ports:
+      - "3000:8080"
+    environment:
+      # Ollama Configuration
+      - 'OLLAMA_BASE_URL=http://ollama:11434'
+      - 'WEBUI_SECRET_KEY='
+      
+      # Vector Database Configuration (Qdrant default)
+      - 'QDRANT_URI=http://qdrant:6333'
+      - 'ENABLE_RAG_HYBRID_SEARCH=true'
+      - 'ENABLE_RAG_WEB_LOADER_SSL_VERIFICATION=false'
+      
+      # Search Configuration
+      - 'SEARXNG_QUERY_URL=http://searxng:8080/search?q=<query>&format=json'
+      - 'ENABLE_WEB_SEARCH=true'
+      - 'WEB_SEARCH_ENGINE=searxng'
+      
+      # ✅ FIXED MCP GitLab Configuration - MAIN CHANGE
+      - 'ENABLE_MCP=true'
+      - 'MCP_SERVERS=[{"name": "gitlab-snpb", "url": "http://mcp-gitlab-server:3333", "type": "http", "description": "GitLab MCP Server for git.snpb.app"}]'
+      
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+# Networks
+networks:
+  default:
+    name: ollama-network
+    driver: bridge
+
+# Volumes (UNCHANGED as requested)
+volumes:
+  ollama_data:
+    driver: local
+  qdrant_data:
+    driver: local
+  git_repos:
+    driver: local
