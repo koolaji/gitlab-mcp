@@ -1,0 +1,561 @@
+#!/usr/bin/env node
+/**
+ * MCP GitLab Server for git.snpb.app
+ * A JavaScript-based Model Context Protocol server for GitLab integration
+ */
+
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const compression = require('compression');
+const { body, validationResult } = require('express-validator');
+const winston = require('winston');
+const fs = require('fs-extra');
+const path = require('path');
+const crypto = require('crypto');
+const simpleGit = require('simple-git');
+//const { Gitlab } = require('node-gitlab-api');
+const { Gitlab } = require('@gitbeaker/rest');
+const WebSocket = require('ws');
+const cron = require('node-cron');
+const YAML = require('yaml');
+
+require('dotenv').config();
+
+// Configure Winston logger
+const logger = winston.createLogger({
+  level: process.env.LOG_LEVEL || 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.errors({ stack: true }),
+    winston.format.json()
+  ),
+  defaultMeta: { service: 'mcp-gitlab-server' },
+  transports: [
+    new winston.transports.File({ filename: '/app/logs/error.log', level: 'error' }),
+    new winston.transports.File({ filename: '/app/logs/combined.log' }),
+    new winston.transports.Console({
+      format: winston.format.combine(
+        winston.format.colorize(),
+        winston.format.simple()
+      )
+    })
+  ]
+});
+
+class MCPGitLabServer {
+  constructor() {
+    this.app = express();
+    this.port = process.env.PORT || 3333;
+    this.gitReposPath = process.env.GIT_REPOS_PATH || '/git-repos';
+    this.configPath = process.env.CONFIG_PATH || '/app/config';
+    
+    // GitLab configuration
+    this.gitlabUrl = process.env.GITLAB_URL || 'https://git.snpb.app';
+    this.gitlabToken = null;
+    this.gitlab = null;
+    
+    // Initialize
+    this.loadConfiguration();
+    this.setupMiddleware();
+    this.setupRoutes();
+    this.setupWebSocket();
+    this.setupCronJobs();
+    this.initializeGitLab();
+  }
+
+  loadConfiguration() {
+    logger.info('Loading configuration...');
+    
+    // Load GitLab token
+    const tokenFile = path.join(this.configPath, 'gitlab-token');
+    if (fs.existsSync(tokenFile)) {
+      this.gitlabToken = fs.readFileSync(tokenFile, 'utf8').trim();
+      logger.info('GitLab token loaded');
+    } else {
+      logger.warn('GitLab token not found, API features will be limited');
+    }
+    
+    // Ensure directories exist
+    fs.ensureDirSync(this.gitReposPath);
+    fs.ensureDirSync('/app/logs');
+    fs.ensureDirSync('/app/cache');
+    
+    logger.info('Configuration loaded', {
+      gitReposPath: this.gitReposPath,
+      gitlabUrl: this.gitlabUrl
+    });
+  }
+
+  setupMiddleware() {
+    // Security middleware
+    this.app.use(helmet());
+    this.app.use(cors());
+    this.app.use(compression());
+    
+    // Rate limiting
+    const limiter = rateLimit({
+      windowMs: 15 * 60 * 1000, // 15 minutes
+      max: 100, // limit each IP to 100 requests per windowMs
+      message: 'Too many requests from this IP'
+    });
+    this.app.use('/api/', limiter);
+    
+    // Body parsing
+    this.app.use(express.json({ limit: '10mb' }));
+    this.app.use(express.urlencoded({ extended: true }));
+    
+    // Request logging
+    this.app.use((req, res, next) => {
+      logger.info('Request received', {
+        method: req.method,
+        url: req.url,
+        ip: req.ip
+      });
+      next();
+    });
+  }
+
+  setupRoutes() {
+    // Health check
+    this.app.get('/health', (req, res) => {
+      res.json({
+        status: 'healthy',
+        timestamp: new Date().toISOString(),
+        gitlabConnected: !!this.gitlab,
+        reposPath: this.gitReposPath
+      });
+    });
+
+    // MCP Protocol endpoints
+    this.app.get('/mcp/capabilities', (req, res) => {
+      res.json({
+        capabilities: {
+          git: {
+            operations: ['clone', 'pull', 'push', 'commit', 'branch', 'status', 'log'],
+            supportedProtocols: ['https', 'ssh']
+          },
+          gitlab: {
+            api: !!this.gitlab,
+            features: ['projects', 'issues', 'merge_requests', 'pipelines', 'webhooks']
+          }
+        }
+      });
+    });
+
+    // Repository management
+    this.app.get('/mcp/repositories', this.handleListRepositories.bind(this));
+    this.app.post('/mcp/git/:operation', this.handleGitOperation.bind(this));
+    
+    // GitLab API endpoints
+    this.app.get('/mcp/gitlab/projects', this.handleGitLabProjects.bind(this));
+    this.app.post('/mcp/gitlab/:operation', this.handleGitLabOperation.bind(this));
+    
+    // Webhook endpoint
+    this.app.post('/webhook/gitlab', this.handleGitLabWebhook.bind(this));
+    
+    // Error handling
+    this.app.use(this.errorHandler.bind(this));
+  }
+
+  async handleListRepositories(req, res) {
+    try {
+      const repos = [];
+      const reposDirs = await fs.readdir(this.gitReposPath);
+      
+      for (const dirName of reposDirs) {
+        const repoPath = path.join(this.gitReposPath, dirName);
+        const gitPath = path.join(repoPath, '.git');
+        
+        if (await fs.pathExists(gitPath)) {
+          try {
+            const git = simpleGit(repoPath);
+            const status = await git.status();
+            const log = await git.log({ maxCount: 1 });
+            const remotes = await git.getRemotes(true);
+            
+            repos.push({
+              name: dirName,
+              path: repoPath,
+              branch: status.current,
+              isDirty: !status.isClean(),
+              untrackedFiles: status.not_added.length,
+              remotes: remotes.map(r => ({ name: r.name, url: r.refs.fetch })),
+              lastCommit: log.latest ? {
+                hash: log.latest.hash.substring(0, 8),
+                message: log.latest.message,
+                author: log.latest.author_name,
+                date: log.latest.date
+              } : null
+            });
+          } catch (error) {
+            logger.warn('Failed to read repository', { repo: dirName, error: error.message });
+          }
+        }
+      }
+      
+      res.json({ success: true, data: repos });
+    } catch (error) {
+      logger.error('Failed to list repositories', { error: error.message });
+      res.status(500).json({ success: false, error: error.message });
+    }
+  }
+
+  async handleGitOperation(req, res) {
+    const { operation } = req.params;
+    const params = req.body;
+    
+    try {
+      let result;
+      
+      switch (operation) {
+        case 'clone':
+          result = await this.cloneRepository(params);
+          break;
+        case 'pull':
+          result = await this.pullRepository(params);
+          break;
+        case 'push':
+          result = await this.pushRepository(params);
+          break;
+        case 'status':
+          result = await this.getRepositoryStatus(params);
+          break;
+        case 'commit':
+          result = await this.commitChanges(params);
+          break;
+        case 'branch':
+          result = await this.manageBranches(params);
+          break;
+        case 'log':
+          result = await this.getCommitLog(params);
+          break;
+        default:
+          throw new Error(`Unsupported Git operation: ${operation}`);
+      }
+      
+      res.json({ success: true, data: result });
+    } catch (error) {
+      logger.error('Git operation failed', { operation, error: error.message });
+      res.status(500).json({ success: false, error: error.message });
+    }
+  }
+
+  async cloneRepository(params) {
+    const { url, name, branch = 'main' } = params;
+    
+    if (!url || !name) {
+      throw new Error('URL and name are required for cloning');
+    }
+    
+    const repoPath = path.join(this.gitReposPath, name);
+    
+    if (await fs.pathExists(repoPath)) {
+      throw new Error(`Repository ${name} already exists`);
+    }
+    
+    const git = simpleGit();
+    await git.clone(url, repoPath, ['--branch', branch]);
+    
+    // Configure repository
+    const repoGit = simpleGit(repoPath);
+    await repoGit.addConfig('user.name', process.env.GIT_AUTHOR_NAME || 'MCP GitLab Bot');
+    await repoGit.addConfig('user.email', process.env.GIT_AUTHOR_EMAIL || 'mcp-bot@snpb.app');
+    
+    logger.info('Repository cloned', { url, path: repoPath, branch });
+    
+    return {
+      name,
+      path: repoPath,
+      url,
+      branch
+    };
+  }
+
+  async pullRepository(params) {
+    const { name } = params;
+    
+    if (!name) {
+      throw new Error('Repository name is required');
+    }
+    
+    const repoPath = path.join(this.gitReposPath, name);
+    
+    if (!await fs.pathExists(repoPath)) {
+      throw new Error(`Repository ${name} not found`);
+    }
+    
+    const git = simpleGit(repoPath);
+    const pullResult = await git.pull();
+    
+    logger.info('Repository pulled', { name, changes: pullResult.summary.changes });
+    
+    return {
+      name,
+      changes: pullResult.summary.changes,
+      insertions: pullResult.summary.insertions,
+      deletions: pullResult.summary.deletions
+    };
+  }
+
+  async handleGitLabProjects(req, res) {
+    if (!this.gitlab) {
+      return res.status(503).json({ success: false, error: 'GitLab client not available' });
+    }
+    
+    try {
+      const projects = await this.gitlab.Projects.all({ owned: true });
+      
+      const projectData = projects.map(project => ({
+        id: project.id,
+        name: project.name,
+        path: project.path,
+        url: project.web_url,
+        sshUrl: project.ssh_url_to_repo,
+        httpUrl: project.http_url_to_repo,
+        defaultBranch: project.default_branch,
+        visibility: project.visibility,
+        description: project.description
+      }));
+      
+      res.json({ success: true, data: projectData });
+    } catch (error) {
+      logger.error('Failed to get GitLab projects', { error: error.message });
+      res.status(500).json({ success: false, error: error.message });
+    }
+  }
+
+  async handleGitLabOperation(req, res) {
+    const { operation } = req.params;
+    const params = req.body;
+    
+    if (!this.gitlab) {
+      return res.status(503).json({ success: false, error: 'GitLab client not available' });
+    }
+    
+    try {
+      let result;
+      
+      switch (operation) {
+        case 'issues':
+          result = await this.getGitLabIssues(params);
+          break;
+        case 'merge_requests':
+          result = await this.getMergeRequests(params);
+          break;
+        case 'create_issue':
+          result = await this.createGitLabIssue(params);
+          break;
+        case 'create_merge_request':
+          result = await this.createMergeRequest(params);
+          break;
+        case 'pipelines':
+          result = await this.getPipelines(params);
+          break;
+        default:
+          throw new Error(`Unsupported GitLab operation: ${operation}`);
+      }
+      
+      res.json({ success: true, data: result });
+    } catch (error) {
+      logger.error('GitLab operation failed', { operation, error: error.message });
+      res.status(500).json({ success: false, error: error.message });
+    }
+  }
+
+  async createGitLabIssue(params) {
+    const { projectId, title, description = '', labels = [], assigneeIds = [] } = params;
+    
+    if (!projectId || !title) {
+      throw new Error('projectId and title are required');
+    }
+    
+    const issue = await this.gitlab.Issues.create(projectId, {
+      title,
+      description,
+      labels: labels.join(','),
+      assignee_ids: assigneeIds
+    });
+    
+    logger.info('GitLab issue created', { projectId, issueId: issue.id });
+    
+    return {
+      id: issue.id,
+      iid: issue.iid,
+      title: issue.title,
+      url: issue.web_url,
+      state: issue.state
+    };
+  }
+
+  async handleGitLabWebhook(req, res) {
+    const payload = req.body;
+    const eventType = req.headers['x-gitlab-event'];
+    
+    logger.info('Received GitLab webhook', { eventType });
+    
+    try {
+      switch (eventType) {
+        case 'Push Hook':
+          await this.handlePushEvent(payload);
+          break;
+        case 'Merge Request Hook':
+          await this.handleMergeRequestEvent(payload);
+          break;
+        case 'Pipeline Hook':
+          await this.handlePipelineEvent(payload);
+          break;
+        default:
+          logger.info('Unhandled webhook event', { eventType });
+      }
+      
+      res.json({ success: true });
+    } catch (error) {
+      logger.error('Webhook handling failed', { error: error.message });
+      res.status(500).json({ success: false, error: error.message });
+    }
+  }
+
+  async handlePushEvent(payload) {
+    const project = payload.project;
+    const projectName = project.name;
+    
+    if (!projectName) return;
+    
+    // Auto-sync local repository if it exists
+    const repoPath = path.join(this.gitReposPath, projectName);
+    
+    if (await fs.pathExists(repoPath)) {
+      try {
+        const git = simpleGit(repoPath);
+        await git.pull();
+        
+        logger.info('Auto-synced repository', { project: projectName });
+      } catch (error) {
+        logger.error('Failed to auto-sync repository', { project: projectName, error: error.message });
+      }
+    }
+  }
+
+  setupWebSocket() {
+    const wss = new WebSocket.Server({ port: 3334 });
+    
+    wss.on('connection', (ws) => {
+      logger.info('WebSocket client connected');
+      
+      ws.on('message', (message) => {
+        try {
+          const data = JSON.parse(message);
+          logger.info('WebSocket message received', { type: data.type });
+          
+          // Handle real-time requests
+          this.handleWebSocketMessage(ws, data);
+        } catch (error) {
+          logger.error('WebSocket message error', { error: error.message });
+        }
+      });
+      
+      ws.on('close', () => {
+        logger.info('WebSocket client disconnected');
+      });
+    });
+    
+    this.wss = wss;
+    logger.info('WebSocket server started on port 3334');
+  }
+
+  setupCronJobs() {
+    // Auto-sync repositories every 5 minutes
+    cron.schedule('*/5 * * * *', async () => {
+      logger.info('Running scheduled repository sync');
+      await this.syncAllRepositories();
+    });
+    
+    // Cleanup logs daily
+    cron.schedule('0 0 * * *', async () => {
+      logger.info('Running daily cleanup');
+      await this.cleanupLogs();
+    });
+  }
+
+  async syncAllRepositories() {
+    try {
+      const repos = await fs.readdir(this.gitReposPath);
+      
+      for (const repoName of repos) {
+        const repoPath = path.join(this.gitReposPath, repoName);
+        const gitPath = path.join(repoPath, '.git');
+        
+        if (await fs.pathExists(gitPath)) {
+          try {
+            const git = simpleGit(repoPath);
+            await git.pull();
+            logger.debug('Repository synced', { repo: repoName });
+          } catch (error) {
+            logger.warn('Failed to sync repository', { repo: repoName, error: error.message });
+          }
+        }
+      }
+    } catch (error) {
+      logger.error('Repository sync failed', { error: error.message });
+    }
+  }
+
+  initializeGitLab() {
+    if (!this.gitlabToken) {
+      logger.warn('GitLab token not available, API features will be limited');
+      return;
+    }
+    
+    try {
+      this.gitlab = new Gitlab({
+        url: this.gitlabUrl,
+        token: this.gitlabToken
+      });
+      
+      logger.info('GitLab client initialized', { url: this.gitlabUrl });
+    } catch (error) {
+      logger.error('Failed to initialize GitLab client', { error: error.message });
+    }
+  }
+
+  errorHandler(error, req, res, next) {
+    logger.error('Unhandled error', { 
+      error: error.message, 
+      stack: error.stack,
+      url: req.url,
+      method: req.method
+    });
+    
+    res.status(500).json({
+      success: false,
+      error: process.env.NODE_ENV === 'production' ? 'Internal Server Error' : error.message
+    });
+  }
+
+  start() {
+    this.app.listen(this.port, '0.0.0.0', () => {
+      logger.info('MCP GitLab Server started', { 
+        port: this.port,
+        gitlabUrl: this.gitlabUrl,
+        reposPath: this.gitReposPath
+      });
+    });
+  }
+}
+
+// Start the server
+const server = new MCPGitLabServer();
+server.start();
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  logger.info('SIGTERM received, shutting down gracefully');
+  process.exit(0);
+});
+
+process.on('SIGINT', () => {
+  logger.info('SIGINT received, shutting down gracefully');
+  process.exit(0);
+});

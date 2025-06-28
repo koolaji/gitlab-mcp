@@ -1,0 +1,55 @@
+# Data directories
+chroma_data/
+gitlab-cache/
+gitlab-webhooks/
+git-repos/
+ollama/
+open-webui/
+qdrant_storage/
+searxng/
+ssh-keys/
+weaviate_data/
+mcp-gitlab-config/
+
+# Environment variables
+.env
+.env.*
+
+# Log files
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db
+
+# Docker volumes
+*_data/
+data/
+
+# Cache files
+.cache/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build artifacts
+dist/
+build/
+*.o
+*.so
+*.dylib
